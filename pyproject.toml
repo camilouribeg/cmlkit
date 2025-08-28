@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "cmlkit"
-version = "2025.0.1.0"
+version = "2025.0.2.0"
 description = "ma machine learning package to facilitate analysis and reproduce verified code"
 authors = ["camilouribeg"]
 license = "None"
@@ -10,6 +10,8 @@ readme = "README.md"
 python = "^3.11.4"
 pandas = "2.2.2"
 scikit-learn = "1.5.1"
+seaborn = "^0.13.2"
+tqdm = "^4.67.1"
 
 
 [tool.poetry.group.dev.dependencies]
