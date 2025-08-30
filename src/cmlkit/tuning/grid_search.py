@@ -1,8 +1,65 @@
+# --- cmlkit.tuning.grid_search (robust, XGB-friendly) ---
+
 from typing import Optional, Dict, Any, Tuple, Iterable, List
 import time, numpy as np, pandas as pd
 from tqdm.auto import tqdm
 from sklearn.base import clone
 from sklearn.model_selection import ParameterGrid, StratifiedKFold, cross_validate
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    recall_score,
+    precision_score,
+    roc_auc_score,
+)
+
+# Supported metrics
+SCORING_MAP: Dict[str, str] = {
+    "roc_auc": "roc_auc",
+    "recall": "recall",
+    "precision": "precision",
+    "f1": "f1",
+    "accuracy": "accuracy",
+}
+
+
+def _ensure_metrics(metrics: Optional[Iterable[str]]) -> List[str]:
+    if metrics is None:
+        return list(SCORING_MAP.keys())
+    m = list(dict.fromkeys(metrics))
+    unknown = [x for x in m if x not in SCORING_MAP]
+    if unknown:
+        raise ValueError(
+            f"Unsupported metrics {unknown}. Choose from {list(SCORING_MAP)}."
+        )
+    return m
+
+
+def _val_metric(est, X, y, metric: str) -> float:
+    # Safe evaluation (handles lack of proba / single-class folds)
+    try:
+        if metric == "roc_auc":
+            if len(np.unique(y)) < 2:
+                return np.nan
+            if hasattr(est, "predict_proba"):
+                s = est.predict_proba(X)[:, 1]
+            elif hasattr(est, "decision_function"):
+                s = est.decision_function(X)
+            else:
+                return accuracy_score(y, est.predict(X))
+            return float(roc_auc_score(y, s))
+        elif metric == "accuracy":
+            return float(accuracy_score(y, est.predict(X)))
+        elif metric == "recall":
+            return float(recall_score(y, est.predict(X)))
+        elif metric == "precision":
+            return float(precision_score(y, est.predict(X)))
+        elif metric == "f1":
+            return float(f1_score(y, est.predict(X)))
+        else:
+            raise ValueError(f"Unsupported metric '{metric}'")
+    except Exception:
+        return np.nan
 
 
 def grid_search_with_progress(
@@ -11,11 +68,11 @@ def grid_search_with_progress(
     X_train,
     y_train,
     *,
-    scoring: str = "roc_auc",  # metric used to pick best params
-    metrics: Optional[Iterable[str]] = None,  # metrics to report (mean/std)
+    scoring: str = "roc_auc",
+    metrics: Optional[Iterable[str]] = None,
     cv: int = 5,
     random_state: int = 42,
-    n_jobs: Optional[int] = None,
+    n_jobs: Optional[int] = None,  # tip: use 1 for xgboost to avoid thread pile-up
     X_val=None,
     y_val=None,
     refit: bool = True,
@@ -24,16 +81,13 @@ def grid_search_with_progress(
 ) -> Tuple[pd.DataFrame, Any, Dict[str, Any], float, Optional[Dict[str, float]]]:
     """
     Grid search with tqdm and tidy multi-metric summary.
+    - Uses sklearn.cross_validate when possible
+    - Falls back to a manual StratifiedKFold loop if needed (e.g., XGB quirks)
+    - Logs 'status' and 'error_msg' per row, plus fit time
 
     Returns
     -------
-    results_df : pd.DataFrame
-        Sorted by mean_cv_<scoring> desc. Includes mean/std columns for each metric.
-        Adds 'status', 'fit_seconds', and 'error_msg' ('' if ok).
-    best_estimator : fitted estimator or None
-    best_params : dict
-    best_cv_score : float
-    val_scores : dict(metric -> score) or None
+    results_df, best_estimator, best_params, best_cv_score, val_scores
     """
     if scoring not in SCORING_MAP:
         raise ValueError(
@@ -45,8 +99,7 @@ def grid_search_with_progress(
     rows: List[Dict[str, Any]] = []
     grid = list(ParameterGrid(param_grid))
 
-    def _run_manual_cv(est_proto, params):
-        """Manual CV loop (no sklearn tags). Returns row dict."""
+    def _run_manual_cv(est_proto, params) -> Dict[str, Any]:
         cv_splitter = StratifiedKFold(
             n_splits=cv, shuffle=True, random_state=random_state
         )
@@ -54,14 +107,9 @@ def grid_search_with_progress(
         for tr_idx, va_idx in cv_splitter.split(X_train, y_train):
             est = clone(est_proto).set_params(**params)
             est.fit(X_train[tr_idx], y_train[tr_idx])
+            Xv, yv = X_train[va_idx], y_train[va_idx]
             for m in metrics_list:
-                # AUC needs both classes; guard with NaN if needed
-                if m == "roc_auc" and len(np.unique(y_train[va_idx])) < 2:
-                    fold_scores[m].append(np.nan)
-                else:
-                    fold_scores[m].append(
-                        _val_metric(est, X_train[va_idx], y_train[va_idx], m)
-                    )
+                fold_scores[m].append(_val_metric(est, Xv, yv, m))
         row = dict(params)
         for m in metrics_list:
             arr = np.array(fold_scores[m], dtype=float)
@@ -71,20 +119,19 @@ def grid_search_with_progress(
         row["error_msg"] = ""
         return row
 
-    pbar = tqdm(
-        grid, desc=f"GridSearch (opt={scoring}, backend={backend})", disable=not verbose
-    )
     use_manual = backend == "manual"
     use_sklearn = backend == "sklearn"
 
+    pbar = tqdm(
+        grid, desc=f"GridSearch (opt={scoring}, backend={backend})", disable=not verbose
+    )
     for params in pbar:
         t0 = time.time()
-        row: Dict[str, Any]
         try:
             if use_manual:
                 row = _run_manual_cv(estimator, params)
             else:
-                # try sklearn cross_validate
+                # Try sklearn CV first
                 cv_out = cross_validate(
                     clone(estimator).set_params(**params),
                     X_train,
@@ -99,14 +146,14 @@ def grid_search_with_progress(
                 )
                 row = dict(params)
                 for m in metrics_list:
-                    m_scores = cv_out[f"test_{m}"]
-                    row[f"mean_cv_{m}"] = float(np.mean(m_scores))
-                    row[f"std_cv_{m}"] = float(np.std(m_scores))
+                    s = cv_out[f"test_{m}"]
+                    row[f"mean_cv_{m}"] = float(np.mean(s))
+                    row[f"std_cv_{m}"] = float(np.std(s))
                 row["status"] = "ok"
                 row["error_msg"] = ""
         except Exception as e:
             if backend == "auto" and not use_manual:
-                # fallback to manual
+                # Fallback to manual loop
                 try:
                     row = _run_manual_cv(estimator, params)
                 except Exception as e2:
@@ -125,10 +172,8 @@ def grid_search_with_progress(
                 row["error_msg"] = f"{type(e).__name__}: {e}"
 
         refit_key = f"mean_cv_{scoring}"
-        refit_val = row.get(refit_key, np.nan)
-        pbar.set_postfix(
-            {refit_key: f"{refit_val:.4f}" if np.isfinite(refit_val) else "nan"}
-        )
+        v = row.get(refit_key, np.nan)
+        pbar.set_postfix({refit_key: f"{v:.4f}" if np.isfinite(v) else "nan"})
         row["fit_seconds"] = round(time.time() - t0, 3)
         rows.append(row)
 
