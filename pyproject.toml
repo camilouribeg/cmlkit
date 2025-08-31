@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "cmlkit"
-version = "2025.0.2.2"
+version = "2025.0.3.0"
 description = "ma machine learning package to facilitate analysis and reproduce verified code"
 authors = ["camilouribeg"]
 license = "None"
